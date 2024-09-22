@@ -1,7 +1,7 @@
-#![doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))]
 #![forbid(unsafe_code)]
 
 use bytes::BytesMut;
+use idl::InternedData;
 use prost::Message;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,6 +37,8 @@ pub struct PerfettoLayer<W = fn() -> std::io::Stdout> {
     track_uuid: TrackUuid,
     writer: W,
     config: Config,
+    pid: i32,
+    aslr_offset: Option<u64>,
 }
 
 /// Writes encoded records into provided instance.
@@ -65,6 +67,9 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             track_uuid: TrackUuid::new(rand::random()),
             writer,
             config: Config::default(),
+            // todo: change the way to get an offset
+            pid: std::process::id() as i32,
+            aslr_offset: read_aslr_offset().ok(),
         }
     }
 
@@ -112,7 +117,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             packet.optional_trusted_uid = Some(idl::trace_packet::OptionalTrustedUid::TrustedUid(
                 self.sequence_id.get() as _,
             ));
-            let thread = create_thread_descriptor().into();
+            let thread = create_thread_descriptor(self.pid).into();
             let track_desc = create_track_descriptor(
                 thread_track_uuid.into(),
                 self.track_uuid.get().into(),
@@ -133,7 +138,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             packet.optional_trusted_uid = Some(idl::trace_packet::OptionalTrustedUid::TrustedUid(
                 self.sequence_id.get() as _,
             ));
-            let process = create_process_descriptor().into();
+            let process = create_process_descriptor(self.pid).into();
             let track_desc = create_track_descriptor(
                 self.track_uuid.get().into(),
                 None,
@@ -187,6 +192,7 @@ impl TrackUuid {
 
 struct PerfettoVisitor {
     perfetto: bool,
+    name: Option<String>,
     filter: fn(&str) -> bool,
 }
 
@@ -195,14 +201,18 @@ impl PerfettoVisitor {
         Self {
             filter,
             perfetto: false,
+            name: None,
         }
     }
 }
 
 impl Visit for PerfettoVisitor {
-    fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if (self.filter)(field.name()) {
             self.perfetto = true;
+        }
+        if field.name() == "name" {
+            self.name = Some(format!("{:?}", value));
         }
     }
 }
@@ -217,12 +227,14 @@ where
             return;
         };
 
+        let name = &mut None;
         let enabled = self
             .config
             .filter
             .map(|f| {
                 let mut visitor = PerfettoVisitor::new(f);
                 attrs.record(&mut visitor);
+                *name = visitor.name;
                 visitor.perfetto
             })
             .unwrap_or(true);
@@ -238,33 +250,53 @@ where
 
         let mut packet = idl::TracePacket::default();
         let thread_track_uuid = THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed));
+        let name = name.as_ref().map_or_else(|| span.name(), |v| v.as_str());
         let event = create_event(
             thread_track_uuid,
-            Some(span.name()),
+            Some(name),
             span.metadata().file().zip(span.metadata().line()),
             debug_annotations,
             Some(idl::track_event::Type::SliceBegin),
         );
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
-        packet.trusted_pid = Some(std::process::id() as _);
+        packet.trusted_pid = Some(self.pid);
         packet.optional_trusted_packet_sequence_id = Some(
             idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
                 self.sequence_id.get() as _,
             ),
         );
+        packet.interned_data = Some(InternedData {
+            debug_annotation_names: vec![idl::DebugAnnotationName {
+                iid: Some(1),
+                name: Some("aslr_offset".to_string()),
+            }],
+            debug_annotation_string_values: vec![idl::InternedString {
+                iid: Some(1),
+                str: self.aslr_offset.map(|v| {
+                    v.to_string()
+                        .chars()
+                        .map(|c| c.to_digit(10).unwrap() as u8)
+                        .collect()
+                }),
+            }],
+            ..Default::default()
+        });
+
         span.extensions_mut().insert(idl::Trace {
             packet: vec![packet],
         });
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let name = &mut None;
         let enabled = self
             .config
             .filter
             .map(|f| {
                 let mut visitor = PerfettoVisitor::new(f);
                 event.record(&mut visitor);
+                *name = visitor.name;
                 visitor.perfetto
             })
             .unwrap_or_default();
@@ -282,10 +314,13 @@ where
             event.record(&mut debug_annotations);
         }
 
+        let name = name
+            .as_ref()
+            .map_or_else(|| metadata.name(), |v| v.as_str());
         let track_event = THREAD_TRACK_UUID.with(|id| {
             create_event(
                 id.load(Ordering::Relaxed),
-                Some(metadata.name()),
+                Some(name),
                 location,
                 debug_annotations,
                 Some(idl::track_event::Type::Instant),
@@ -293,13 +328,29 @@ where
         });
         let mut packet = idl::TracePacket::default();
         packet.data = Some(idl::trace_packet::Data::TrackEvent(track_event));
-        packet.trusted_pid = Some(std::process::id() as _);
+        packet.trusted_pid = Some(self.pid);
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
         packet.optional_trusted_packet_sequence_id = Some(
             idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
                 self.sequence_id.get() as _,
             ),
         );
+        packet.interned_data = Some(InternedData {
+            debug_annotation_names: vec![idl::DebugAnnotationName {
+                iid: Some(1),
+                name: Some("aslr_offset".to_string()),
+            }],
+            debug_annotation_string_values: vec![idl::InternedString {
+                iid: Some(1),
+                str: self.aslr_offset.map(|v| {
+                    v.to_string()
+                        .chars()
+                        .map(|c| c.to_digit(10).unwrap() as u8)
+                        .collect()
+                }),
+            }],
+            ..Default::default()
+        });
 
         if let Some(span) = ctx.event_span(event) {
             if let Some(trace) = span.extensions_mut().get_mut::<idl::Trace>() {
@@ -313,6 +364,29 @@ where
         self.write_log(trace);
     }
 
+    fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+
+        let mut ext = span.extensions_mut();
+        let Some(trace) = ext.get_mut::<idl::Trace>() else {
+            return;
+        };
+
+        for packet in trace.packet.iter_mut() {
+            if let Some(idl::trace_packet::Data::TrackEvent(ref mut e)) = &mut packet.data {
+                // track_event::Type::SliceBegin
+                if e.r#type == Some(1) {
+                    let mut debug_annotations = DebugAnnotations::default();
+                    values.record(&mut debug_annotations);
+                    e.debug_annotations
+                        .append(&mut debug_annotations.annotations)
+                }
+            }
+        }
+    }
+
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(&id) else {
             return;
@@ -323,13 +397,23 @@ where
         };
 
         let debug_annotations = DebugAnnotations::default();
-
         let mut packet = idl::TracePacket::default();
         let meta = span.metadata();
+
+        let Some(Some(idl::trace_packet::Data::TrackEvent(te))) =
+            trace.packet.get(0).map(|p| &p.data)
+        else {
+            return;
+        };
+
+        let Some(idl::track_event::NameField::Name(name_str)) = te.name_field.as_ref() else {
+            return;
+        };
+
         let event = THREAD_TRACK_UUID.with(|id| {
             create_event(
                 id.load(Ordering::Relaxed),
-                Some(meta.name()),
+                Some(name_str.as_str()),
                 meta.file().zip(meta.line()),
                 debug_annotations,
                 Some(idl::track_event::Type::SliceEnd),
@@ -337,29 +421,46 @@ where
         });
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
-        packet.trusted_pid = Some(std::process::id() as _);
+        packet.trusted_pid = Some(self.pid);
         packet.optional_trusted_packet_sequence_id = Some(
             idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
                 self.sequence_id.get() as _,
             ),
         );
+        packet.interned_data = Some(InternedData {
+            debug_annotation_names: vec![idl::DebugAnnotationName {
+                iid: Some(1),
+                name: Some("aslr_offset".to_string()),
+            }],
+            debug_annotation_string_values: vec![idl::InternedString {
+                iid: Some(1),
+                str: self.aslr_offset.map(|v| {
+                    v.to_string()
+                        .chars()
+                        .map(|c| c.to_digit(10).unwrap() as u8)
+                        .collect()
+                }),
+            }],
+            ..Default::default()
+        });
+
         trace.packet.push(packet);
 
         self.write_log(trace);
     }
 }
 
-fn create_thread_descriptor() -> idl::ThreadDescriptor {
+fn create_thread_descriptor(pid: i32) -> idl::ThreadDescriptor {
     let mut thread = idl::ThreadDescriptor::default();
-    thread.pid = Some(std::process::id() as _);
+    thread.pid = Some(pid);
     thread.tid = Some(thread_id::get() as _);
     thread.thread_name = std::thread::current().name().map(|n| n.to_string());
     thread
 }
 
-fn create_process_descriptor() -> idl::ProcessDescriptor {
+fn create_process_descriptor(pid: i32) -> idl::ProcessDescriptor {
     let mut process = idl::ProcessDescriptor::default();
-    process.pid = Some(std::process::id() as _);
+    process.pid = Some(pid);
     process
 }
 
@@ -500,5 +601,34 @@ impl Visit for DebugAnnotations {
             "{value}"
         )));
         self.annotations.push(annotation);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn read_aslr_offset() -> procfs::ProcResult<u64> {
+    use procfs::process::{MMapPath, Process};
+
+    let process = Process::myself()?;
+    let exe = process.exe()?;
+    let maps = &process.maps()?;
+    let mut addresses: Vec<u64> = maps
+        .iter()
+        .filter_map(|map| {
+            let MMapPath::Path(bin_path) = &map.pathname else {
+                return None;
+            };
+            if bin_path != &exe {
+                return None;
+            }
+
+            return Some(map.address.0);
+        })
+        .collect();
+
+    addresses.sort();
+    if let Some(addr) = addresses.get(0) {
+        Ok(*addr)
+    } else {
+        panic!("no memory map error.")
     }
 }

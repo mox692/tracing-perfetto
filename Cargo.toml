@@ -15,6 +15,10 @@ description = """
 Tracing layer for recording spans and events as perfetto event format.
 """
 
+[features]
+symbolize = ["clap", "hopframe"]
+default = []
+
 [dependencies]
 anyhow = "1.0.86"
 bytes = "1.6.0"
@@ -25,12 +29,25 @@ thread-id = "4.2.1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
+# optional deps
+clap = { version = "4.5", optional = true, features = ["derive"] }
+tokio = { version = "1", features = [ "macros", "rt-multi-thread" ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hopframe = { git = "https://github.com/mox692/hopframe.git", optional = true }
+procfs = "0.16"
+
 [build-dependencies]
 prost-build = "0.12"
+protobuf = "3"
 protobuf-src = "2.0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = [ "full" ] }
 tracing-subscriber = "0.3"
 tracing = "0.1"
 anyhow = "1"
+
+[[bin]]
+name = "perfetto_symbolize"
+path = "src/perfetto_symbolize.rs"
+required-features = ["symbolize"]
