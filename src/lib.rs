@@ -16,6 +16,8 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
+pub mod external;
+
 mod idl {
     include!(concat!(env!("OUT_DIR"), "/perfetto.protos.rs"));
 }
@@ -38,6 +40,7 @@ pub struct PerfettoLayer<W = fn() -> std::io::Stdout> {
     writer: W,
     config: Config,
     pid: i32,
+    // TODO: move to tokio's layer
     aslr_offset: Option<u64>,
 }
 

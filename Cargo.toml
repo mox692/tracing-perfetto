@@ -34,7 +34,7 @@ clap = { version = "4.5", optional = true, features = ["derive"] }
 tokio = { version = "1", features = [ "macros", "rt-multi-thread" ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-hopframe = { git = "https://github.com/mox692/hopframe.git", optional = true }
+hopframe = { git = "https://github.com/mox692/hopframe.git", optional = true, features = ["symbolize"] }
 procfs = "0.16"
 
 [build-dependencies]
