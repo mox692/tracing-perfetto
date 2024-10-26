@@ -196,6 +196,7 @@ impl TrackUuid {
 struct PerfettoVisitor {
     perfetto: bool,
     name: Option<String>,
+    is_runtask: bool,
     filter: fn(&str) -> bool,
 }
 
@@ -205,6 +206,7 @@ impl PerfettoVisitor {
             filter,
             perfetto: false,
             name: None,
+            is_runtask: false,
         }
     }
 }
@@ -214,8 +216,14 @@ impl Visit for PerfettoVisitor {
         if (self.filter)(field.name()) {
             self.perfetto = true;
         }
-        if field.name() == "name" {
+        let field_name = field.name();
+        if field_name == "name" {
             self.name = Some(format!("{:?}", value));
+        }
+        if field_name == "tokio_runtime_event" {
+            if format!("{:?}", value).contains("run_task") {
+                self.is_runtask = true;
+            }
         }
     }
 }
@@ -231,6 +239,7 @@ where
         };
 
         let name = &mut None;
+        let is_runtask = &mut false;
         let enabled = self
             .config
             .filter
@@ -238,6 +247,7 @@ where
                 let mut visitor = PerfettoVisitor::new(f);
                 attrs.record(&mut visitor);
                 *name = visitor.name;
+                *is_runtask = visitor.is_runtask;
                 visitor.perfetto
             })
             .unwrap_or(true);
@@ -253,10 +263,13 @@ where
 
         let mut packet = idl::TracePacket::default();
         let thread_track_uuid = THREAD_TRACK_UUID.with(|id| id.load(Ordering::Relaxed));
-        let name = name.as_ref().map_or_else(|| span.name(), |v| v.as_str());
+        let mut name = name.clone().map_or_else(|| span.name().to_string(), |v| v);
+        if *is_runtask {
+            name = format!("task {name}");
+        }
         let event = create_event(
             thread_track_uuid,
-            Some(name),
+            Some(&name),
             span.metadata().file().zip(span.metadata().line()),
             debug_annotations,
             Some(idl::track_event::Type::SliceBegin),
@@ -293,6 +306,7 @@ where
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let name = &mut None;
+        let is_runtask = &mut false;
         let enabled = self
             .config
             .filter
@@ -300,6 +314,7 @@ where
                 let mut visitor = PerfettoVisitor::new(f);
                 event.record(&mut visitor);
                 *name = visitor.name;
+                *is_runtask = visitor.is_runtask;
                 visitor.perfetto
             })
             .unwrap_or_default();
@@ -317,13 +332,16 @@ where
             event.record(&mut debug_annotations);
         }
 
-        let name = name
-            .as_ref()
-            .map_or_else(|| metadata.name(), |v| v.as_str());
+        let mut name = name
+            .clone()
+            .map_or_else(|| metadata.name().to_string(), |v| v);
+        if *is_runtask {
+            name = format!("task {name}");
+        }
         let track_event = THREAD_TRACK_UUID.with(|id| {
             create_event(
                 id.load(Ordering::Relaxed),
-                Some(name),
+                Some(&name),
                 location,
                 debug_annotations,
                 Some(idl::track_event::Type::Instant),
@@ -413,14 +431,35 @@ where
             return;
         };
 
+        let has_runtask = te
+            .debug_annotations
+            .iter()
+            .find(|a| {
+                a.name_field.as_ref()
+                    == Some(&idl::debug_annotation::NameField::Name(
+                        "run_task".to_string(),
+                    ))
+            })
+            .is_some();
+
         let event = THREAD_TRACK_UUID.with(|id| {
-            create_event(
-                id.load(Ordering::Relaxed),
-                Some(name_str.as_str()),
-                meta.file().zip(meta.line()),
-                debug_annotations,
-                Some(idl::track_event::Type::SliceEnd),
-            )
+            if has_runtask {
+                create_event(
+                    id.load(Ordering::Relaxed),
+                    Some(format!("task {name_str}").as_str()),
+                    meta.file().zip(meta.line()),
+                    debug_annotations,
+                    Some(idl::track_event::Type::SliceEnd),
+                )
+            } else {
+                create_event(
+                    id.load(Ordering::Relaxed),
+                    Some(name_str),
+                    meta.file().zip(meta.line()),
+                    debug_annotations,
+                    Some(idl::track_event::Type::SliceEnd),
+                )
+            }
         });
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
         packet.timestamp = chrono::Local::now().timestamp_nanos_opt().map(|t| t as _);
